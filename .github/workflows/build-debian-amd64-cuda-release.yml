@@ -1,0 +1,104 @@
+name: Build Debian amd64 CUDA release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to upload assets to
+        required: true
+        default: v3.0.0
+      cuda_architectures:
+        description: CMake CUDA architectures, for example 75;86;89. Leave empty for a non-native CUDA build.
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: debian-amd64-cuda
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      BUILD_DIR: build-cuda
+      INSTALL_DIR: llama-debian-amd64-cuda
+      CUDA_HOME: /usr/local/cuda-12.6
+    steps:
+      - name: Install build tools and CUDA
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            cmake \
+            curl \
+            g++ \
+            git \
+            libcurl4-openssl-dev \
+            libssl-dev \
+            ninja-build \
+            pkg-config \
+            tar \
+            xz-utils
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+          dpkg -i cuda-keyring_1.1-1_all.deb
+          rm cuda-keyring_1.1-1_all.deb
+          apt-get update
+          apt-get install -y --no-install-recommends cuda-toolkit-12-6
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake_args=(
+            -S .
+            -B "$BUILD_DIR"
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DGGML_CUDA=ON
+            -DGGML_NATIVE=OFF
+            -DLLAMA_CURL=ON
+            -DLLAMA_BUILD_IS_DEV=OFF
+            -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc"
+            -DCMAKE_INSTALL_PREFIX="$PWD/$INSTALL_DIR"
+          )
+
+          if [ -n "${{ inputs.cuda_architectures }}" ]; then
+            cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="${{ inputs.cuda_architectures }}")
+          fi
+
+          cmake "${cmake_args[@]}"
+
+      - name: Build
+        run: cmake --build "$BUILD_DIR" --config Release --parallel
+
+      - name: Install
+        run: cmake --install "$BUILD_DIR" --config Release
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          version="${{ inputs.release_tag }}"
+          version="${version#v}"
+          archive="llama-${version}-bin-debian-amd64-cuda.tar.xz"
+          tar -C "$INSTALL_DIR" -cJf "$archive" .
+          sha256sum "$archive" > "$archive.sha256"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          body: Debian amd64 CUDA build.
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
